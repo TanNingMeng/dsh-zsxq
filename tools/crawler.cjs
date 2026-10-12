@@ -9,12 +9,15 @@
  *   node tools/crawler.js --all-groups --author owner --out zsxq-vault/          # 只看球主发言
  *   node tools/crawler.js --group 48418884588288 --author admin --likes 10 --out zsxq-vault/
  *   node tools/crawler.js --group 48418884588288 --tab 球友必看 --out zsxq-vault/   # 按球内 tab（话题标签）抓
+ *   node tools/crawler.js --group 88882228552542 --columns --files --out zsxq-vault/ # 右下角【专栏】+【星球文件】
  *
  * 参数：
  *   --group <id>        指定星球（可多次传入）
  *   --all-groups        爬取已加入的全部星球
  *   --scope <s>         digests（默认）= 精华 | all = 全部 | questions = 问答 | by_owner = 只看星主 | tasks = 作业（与 --tab 互斥，--tab 优先）
  *   --tab <name|id>     话题标签 tab（如 球友必看、面试、Java 或 hashtag_id，可逗号分隔多个）
+ *   --columns           抓右下角【专栏】全部文章（与 --scope/--tab 独立，可同时用）
+ *   --files             建右下角【星球文件】索引清单（下载有权限限制，仅元数据+来源主题）
  *   --author <a>        owner = 只看球主 | admin = 球主+管理员 | all（默认）= 不过滤
  *   --likes <n>         只收点赞数 ≥ n 的主题
  *   --keywords <list>   逗号分隔词表，命中标题/正文才收录（不传则不过滤）
@@ -127,8 +130,37 @@ class ZsxqClient {
       end_time: endTime ?? ""
     });
   }
+  /** 主题详情（专栏文章的全文要靠它拿，列表/专栏接口只有 ~60 字预览）。 */
+  getTopic(topicId) {
+    return this.request("GET", `/topics/${topicId}`).then((d) => d.topic ?? {});
+  }
   listComments(topicId, count = 20) {
     return this.request("GET", `/topics/${topicId}/comments`, { count });
+  }
+  /** 专栏列表（右下角【专栏】）。 */
+  listColumns(groupId) {
+    return this.request("GET", `/groups/${groupId}/columns`).then((d) => d.columns ?? []);
+  }
+  /** 专栏文章列表。轻量结构 {topic_id,title,text,create_time}，index 为偏移分页。 */
+  listColumnTopics(groupId, columnId, count = 20, index = 0) {
+    return this.request("GET", `/groups/${groupId}/columns/${columnId}/topics`, { count, index });
+  }
+  /** 星球文件列表（右下角【星球文件】）。index 为偏移分页，元素为 {file:{name,size,...}, topic:{topic_id,...}}。 */
+  listFiles(groupId, count = 20, index = 0) {
+    return this.request("GET", `/groups/${groupId}/files`, { count, index });
+  }
+  /** 抓取专栏长文全文页（articles.zsxq.com 的 SSR HTML，必须带 Cookie，否则返回空壳）。 */
+  async getArticleHtml(url) {
+    const resp = await fetch(url, {
+      headers: {
+        Cookie: this.cookie,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126 Safari/537.36",
+        Referer: "https://wx.zsxq.com/"
+      },
+      signal: AbortSignal.timeout(3e4)
+    });
+    if (!resp.ok) throw new ZsxqError(`文章页返回 HTTP ${resp.status}`, resp.status);
+    return resp.text();
   }
 }
 
@@ -170,6 +202,8 @@ function parseArgs(argv) {
     allGroups: false,
     scope: "digests",
     tabs: [],
+    columns: false,
+    files: false,
     author: "all",
     likes: 0,
     keywords: [],
@@ -185,6 +219,8 @@ function parseArgs(argv) {
     else if (a === "--all-groups") args.allGroups = true;
     else if (a === "--scope") args.scope = argv[++i];
     else if (a === "--tab") args.tabs.push(...String(argv[++i]).split(",").map((s) => s.trim()).filter(Boolean));
+    else if (a === "--columns") args.columns = true;
+    else if (a === "--files") args.files = true;
     else if (a === "--author") args.author = argv[++i];
     else if (a === "--likes") args.likes = Number(argv[++i]) || 0;
     else if (a === "--keywords") args.keywords = String(argv[++i]).split(",").map((s) => s.trim()).filter(Boolean);
@@ -263,6 +299,55 @@ function sanitizeFilename(name) {
 }
 function esc(s) {
   return String(s ?? "").replace(/"/g, '\\"');
+}
+// ---------- 专栏长文 HTML → Markdown ----------
+function decodeEntities(s) {
+  return String(s)
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;|&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)));
+}
+/** 轻量 HTML→Markdown：覆盖 quill 编辑器的 p/strong/em/ul/ol/li/img/a/hr/br。 */
+function htmlToMd(html) {
+  let s = String(html);
+  // 图片与链接先保护起来
+  const imgs = [];
+  s = s.replace(/<img[^>]*src="([^"]*)"[^>]*>/g, (_, src) => `\u0000IMG${imgs.push(decodeEntities(src)) - 1}\u0000`);
+  const links = [];
+  s = s.replace(/<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (_, href, text) => `\u0000A${links.push([decodeEntities(href), text]) - 1}\u0000`);
+  // 结构转换
+  s = s.replace(/<(strong|b)>[\s\S]*?<\/\1>/gi, (m) => `**${m.replace(/<[^>]*>/g, "")}**`);
+  s = s.replace(/<(em|i)>[\s\S]*?<\/\1>/gi, (m) => `*${m.replace(/<[^>]*>/g, "")}*`);
+  s = s.replace(/<hr[^>]*>/gi, "\n\n---\n\n");
+  s = s.replace(/<li[^>]*>[\s\S]*?<\/li>/gi, (m) => "\n- " + m.replace(/<[^>]*>/g, "").trim());
+  s = s.replace(/<\/?(ul|ol)[^>]*>/gi, "\n");
+  s = s.replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, (_, t) => `\n\n## ${t.replace(/<[^>]*>/g, "").trim()}\n`);
+  s = s.replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, (_, t) => `\n\n### ${t.replace(/<[^>]*>/g, "").trim()}\n`);
+  s = s.replace(/<p[^>]*>/gi, "\n\n").replace(/<\/p>/gi, "");
+  s = s.replace(/<br\s*\/?>/gi, "\n");
+  // 还原链接/图片
+  s = s.replace(/\u0000A(\d+)\u0000/g, (_, i) => { const [href, text] = links[Number(i)]; return `[${text.replace(/<[^>]*>/g, "").trim() || href}](${href})`; });
+  s = s.replace(/\u0000IMG(\d+)\u0000/g, (_, i) => `\n\n![图片](${imgs[Number(i)]})\n\n`);
+  // 清掉残余标签
+  s = s.replace(/<[^>]*>/g, "");
+  s = decodeEntities(s);
+  return s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+/** 从文章页 HTML 提取正文 div（content ql-editor / milkdown / tiptap 兜底）。 */
+function extractArticleBody(html) {
+  const start = html.search(/<div class="content[^"]*ql-editor[^"]*"/);
+  if (start >= 0) {
+    const rest = html.slice(start);
+    const end = rest.search(/<div class="(milkdown-preview|tiptap-preview|risk_warning_tips)"/);
+    return rest.slice(rest.indexOf(">") + 1, end > 0 ? end : undefined);
+  }
+  const m2 = html.match(/<div class="milkdown-preview"[^>]*>([\s\S]*?)<\/div>/);
+  if (m2) return m2[1];
+  return null;
 }
 
 // ---------- state.json ----------
@@ -463,6 +548,165 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
   } // end channels
 }
 
+// ---------- 专栏 / 星球文件（右下角入口） ----------
+/** 爬取星球全部专栏文章为 Markdown。幂等：文件名含 topic_id，已存在则跳过。 */
+async function crawlColumns(client, limiter, group, args, stats) {
+  const gid = String(group.group_id);
+  const label = group.name ?? gid;
+  await limiter.wait();
+  const columns = await requestWithBackoff(client, () => client.listColumns(gid), `${label}/columns`);
+  if (columns.length === 0) {
+    console.log(`[${label}] 该星球没有专栏`);
+    return;
+  }
+  let collected = 0;
+  for (const col of columns) {
+    const colDir = path.join(outDirSafe, sanitizeFilename(label), "columns", sanitizeFilename(col.name ?? String(col.column_id)));
+    fs.mkdirSync(colDir, { recursive: true });
+    for (let index = 0; ; index += 20) {
+      await limiter.wait();
+      const data = await requestWithBackoff(client, () => client.listColumnTopics(gid, String(col.column_id), 20, index), `${label}/column:${col.name}#${index}`);
+      const items = data.topics ?? [];
+      if (items.length === 0) break;
+      for (const t of items) {
+        const tid = String(t.topic_id ?? "");
+        const file = path.join(colDir, `${String(t.create_time ?? "").slice(0, 10) || "unknown"}-${sanitizeFilename(String(t.title ?? "无标题"))}-${tid}.md`);
+        if (tid && fs.existsSync(file)) continue; // 幂等
+        // 专栏列表接口的 text 只有 ~60 字预览；详情接口对长文也只有截断 text，全文在 talk.article.article_url 的 SSR 页面里
+        await limiter.wait();
+        const detail = await requestWithBackoff(client, () => client.getTopic(tid), `${label}/column-detail:${tid}`);
+        const talk = detail.talk ?? {};
+        const owner = talk.owner ?? t.owner ?? col.owner ?? { name: "匿名" };
+        // 拉全文
+        let fullText = talk.text ?? t.text ?? "";
+        const articleUrl = talk.article?.article_url ?? talk.article?.inline_article_url ?? null;
+        if (articleUrl) {
+          // article_url 偶发返回未登录空壳页（~1.6KB、无 ql-editor），换 inline_article_url 再试一次
+          const candidates = [...new Set([articleUrl, talk.article?.inline_article_url, talk.article?.article_url].filter(Boolean))];
+          for (const u of candidates) {
+            await limiter.wait();
+            try {
+              const html = await requestWithBackoff(client, () => client.getArticleHtml(u), `${label}/column-article:${tid}`);
+              const bodyHtml = extractArticleBody(html);
+              if (!bodyHtml) {
+                console.warn(`[${label}] 文章页疑似空壳（${html.length}B）：${u}，换下一个 URL`);
+                continue;
+              }
+              const md = htmlToMd(bodyHtml);
+              if (md.length > fullText.replace(/<[^>]*>/g, "").length) fullText = md; // 全文优先
+              break;
+            } catch (err) {
+              console.warn(`[${label}] 文章全文获取失败 ${tid}: ${err.message}（回退为详情文本）`);
+            }
+          }
+        }
+        // 评论（可选）
+        let comments = [];
+        if (args.comments > 0 && (detail.comments_count ?? 0) > 0) {
+          await limiter.wait();
+          try {
+            const cd = await requestWithBackoff(client, () => client.listComments(tid, args.comments), `${label}/column-comments/${tid}`);
+            comments = (cd.comments ?? []).slice(0, args.comments);
+          } catch (err) {
+            console.warn(`[${label}] 专栏评论获取失败 ${tid}: ${err.message}`);
+          }
+        }
+        const body = renderRich(t, fullText, talk.images ?? []);
+        const lines = [
+          "---",
+          `topic_id: ${tid}`,
+          `column: "${esc(col.name ?? "")}"`,
+          `author: "${esc(owner.name ?? "匿名")}"`,
+          `author_id: ${owner.user_id ?? ""}`,
+          `created: ${detail.create_time ?? t.create_time ?? ""}`,
+          `likes: ${detail.likes_count ?? 0}`,
+          `comments: ${detail.comments_count ?? 0}`,
+          `reading: ${detail.reading_count ?? 0}`,
+          ...(articleUrl ? [`article_url: "${esc(articleUrl)}"`] : []),
+          `clawed_at: ${new Date().toISOString()}`,
+          "---",
+          "",
+          `# ${t.title ?? detail.title ?? "无标题"}`,
+          "",
+          body,
+          ""
+        ];
+        if (comments.length > 0) {
+          lines.push(`## 评论（${comments.length} 条）`, "");
+          for (const c of comments) {
+            const cm = c.comment ?? c;
+            const who = cm.owner?.name ?? "匿名";
+            const ctext = renderRich(t, String(cm.text ?? ""), cm.images).replace(/\s+/g, " ").slice(0, 500);
+            lines.push(`- **${who}**：${ctext}`);
+          }
+          lines.push("");
+        }
+        fs.writeFileSync(file, lines.join("\n"), "utf8");
+        collected++;
+        if (args.limit > 0 && collected >= args.limit) break;
+      }
+      if (items.length < 20 || (args.limit > 0 && collected >= args.limit)) break;
+    }
+    console.log(`[${label}] ✔ 专栏「${col.name}」处理完成`);
+  }
+  stats[`[${label}] 专栏收录 ${collected} 篇`] = true;
+  console.log(`[${label}] ✔ 专栏共收录 ${collected} 篇`);
+}
+
+/** 建星球文件索引（单个 Markdown 清单）。下载链接接口有权限限制（1030），仅记录元数据与来源主题。 */
+async function crawlFiles(client, limiter, group, args, stats) {
+  const gid = String(group.group_id);
+  const label = group.name ?? gid;
+  const rows = [];
+  for (let index = 0; ; index += 20) {
+    await limiter.wait();
+    const data = await requestWithBackoff(client, () => client.listFiles(gid, 20, index), `${label}/files#${index}`);
+    const items = data.files ?? [];
+    if (items.length === 0) break;
+    for (const entry of items) {
+      const f = entry.file ?? {};
+      const tp = entry.topic ?? {};
+      rows.push({
+        name: String(f.name ?? "未命名"),
+        size: f.size ?? 0,
+        create_time: f.create_time ?? "",
+        downloads: f.download_count ?? 0,
+        file_id: String(f.file_id ?? ""),
+        topic_id: String(tp.topic_id ?? "")
+      });
+    }
+    if (items.length < 20) break;
+  }
+  if (rows.length === 0) {
+    console.log(`[${label}] 该星球没有文件`);
+    return;
+  }
+  rows.sort((a, b) => (a.create_time < b.create_time ? 1 : -1));
+  const lines = [
+    "---",
+    `group_id: ${gid}`,
+    `files: ${rows.length}`,
+    `clawed_at: ${new Date().toISOString()}`,
+    "---",
+    "",
+    `# ${label} 星球文件索引（${rows.length} 个）`,
+    "",
+    "| 文件 | 大小 | 上传时间 | 下载次数 | 来源主题 |",
+    "|---|---|---|---|---|"
+  ];
+  for (const r of rows) {
+    const kb = r.size >= 1048576 ? (r.size / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(r.size / 1024)) + " KB";
+    lines.push(`| ${r.name.replace(/\|/g, "\\|")} | ${kb} | ${r.create_time.slice(0, 10)} | ${r.downloads} | ${r.topic_id} |`);
+  }
+  lines.push("", "> 注：文件下载链接接口有权限限制（code 1030），请通过星球 App/网页下载。`来源主题` 即包含该文件的主题 topic_id，可在本库中搜索定位上下文。", "");
+  const dir = path.join(outDirSafe, sanitizeFilename(label));
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "星球文件索引.md");
+  fs.writeFileSync(file, lines.join("\n"), "utf8");
+  stats[`[${label}] 文件索引 ${rows.length} 个`] = true;
+  console.log(`[${label}] ✔ 文件索引完成：${rows.length} 个 → ${path.basename(file)}`);
+}
+
 // ---------- 主流程 ----------
 let outDirSafe = "./zsxq-vault";
 
@@ -487,6 +731,9 @@ async function main() {
 
   for (const group of groups) {
     try {
+      if (args.columns) await crawlColumns(client, limiter, group, args, stats);
+      if (args.files) await crawlFiles(client, limiter, group, args, stats);
+      if (args.columns || args.files) { saveState(outDirSafe, state); continue; }
       await crawlGroup(client, limiter, group, args, state, stats);
     } catch (err) {
       console.error(`[${group.name ?? group.group_id}] ✘ ${err.message}`);
