@@ -13,7 +13,7 @@
  * 参数：
  *   --group <id>        指定星球（可多次传入）
  *   --all-groups        爬取已加入的全部星球
- *   --scope <s>         digests（默认）= 精华 | all = 全部主题（与 --tab 互斥，--tab 优先）
+ *   --scope <s>         digests（默认）= 精华 | all = 全部 | questions = 问答 | by_owner = 只看星主 | tasks = 作业（与 --tab 互斥，--tab 优先）
  *   --tab <name|id>     话题标签 tab（如 球友必看、面试、Java 或 hashtag_id，可逗号分隔多个）
  *   --author <a>        owner = 只看球主 | admin = 球主+管理员 | all（默认）= 不过滤
  *   --likes <n>         只收点赞数 ≥ n 的主题
@@ -196,8 +196,8 @@ function parseArgs(argv) {
     else throw new Error(`未知参数：${a}`);
   }
   if (!args.allGroups && args.groups.length === 0) throw new Error("请指定 --group <id> 或 --all-groups");
-  if (args.tabs.length === 0 && !["digests", "digested", "all"].includes(args.scope))
-    throw new Error(`--scope 仅支持 digests|all，收到 ${args.scope}`);
+  if (args.tabs.length === 0 && !["digests", "digested", "all", "questions", "by_owner", "tasks"].includes(args.scope))
+    throw new Error(`--scope 仅支持 digests|all|questions(问答)|by_owner(只看星主)|tasks(作业)，收到 ${args.scope}`);
   if (!["owner", "admin", "all"].includes(args.author)) throw new Error(`--author 仅支持 owner|admin|all，收到 ${args.author}`);
   return args;
 }
@@ -205,6 +205,10 @@ function parseArgs(argv) {
 function textOf(topic) {
   const t = topic.talk ?? topic.question ?? topic.answer ?? {};
   return String(t.text ?? "");
+}
+/** q&a 主题的回答者（无则 null）。 */
+function answerOf(topic) {
+  return topic.answer ?? null;
 }
 function authorOf(topic) {
   const t = topic.talk ?? topic.question ?? topic.answer ?? {};
@@ -223,23 +227,36 @@ function titleOf(topic) {
   if (raw && !/[…]{1,3}$|\.\.\.?$/.test(raw)) return raw;
   return firstLine || raw || "无标题";
 }
-/** 提取 <e type="hashtag|web" title="..."> 内的可读文本，保留正文主体。 */
-function renderText(topic) {
-  let text = textOf(topic);
+/** 实体还原 + 图片附加（对任意 text 字段复用）。 */
+function renderRich(topic, text, images) {
   // hashtag/web/link 实体还原为可读形式
-  text = text.replace(/<e type="hashtag"[^>]*title="([^"]*)"[^>]*>[\s\S]*?<\/e>/g, (_, t) => `#${decodeURIComponent(t)}#`);
+  text = String(text ?? "").replace(/<e type="hashtag"[^>]*title="([^"]*)"[^>]*>[\s\S]*?<\/e>/g, (_, t) => `#${decodeURIComponent(t)}#`);
   text = text.replace(/<e type="web"[^>]*href="([^"]*)"[^>]*title="([^"]*)"[^>]*>[\s\S]*?<\/e>/g, (_, href, title) => {
     const url = decodeURIComponent(href);
     const name = decodeURIComponent(title || url);
     return `[${name}](${url})`;
   });
   text = text.replace(/<\/?e[^>]*>/g, "");
-  // 图片
-  const images = (topic.talk?.images ?? [])
-    .map((img) => img.large?.url ?? img.thumbnail?.url ?? "")
-    .filter(Boolean);
-  for (const u of images) text += `\n\n![图片](${u})`;
+  for (const u of (images ?? []).map((img) => img.large?.url ?? img.thumbnail?.url ?? "").filter(Boolean)) {
+    text += `\n\n![图片](${u})`;
+  }
   return text.trim();
+}
+/** 完整正文。q&a 类型渲染「提问者的问题 + 回答者的回答」两段，缺一不可。 */
+function renderText(topic) {
+  if (topic.type === "q&a" || (topic.question && topic.answer)) {
+    const q = topic.question ?? {};
+    const a = topic.answer ?? null;
+    let out = `**提问**（${q.owner?.name ?? "匿名"}）：\n\n` + renderRich(topic, q.text, q.images ?? topic.question?.images);
+    if (a) {
+      out += `\n\n---\n\n**回答**（${a.owner?.name ?? "匿名"}）：\n\n` + renderRich(topic, a.text, a.images);
+    } else {
+      out += `\n\n---\n\n*（该问题暂无回答）*`;
+    }
+    return out;
+  }
+  const t = topic.talk ?? topic.question ?? topic.answer ?? {};
+  return renderRich(topic, t.text, topic.talk?.images);
 }
 function sanitizeFilename(name) {
   return name.replace(/[\\/:*?"<>|&]/g, " ").replace(/\s+/g, "-").slice(0, 60).replace(/^-+|-+$/g, "");
@@ -283,6 +300,13 @@ function renderTopicMd(topic, meta, comments) {
     `clawed_at: ${new Date().toISOString()}`
   ];
   if (meta?.tab) lines.push(`tab: "${esc(meta.tab)}"`);
+  const ans = answerOf(topic);
+  if (ans) {
+    lines.push(`answered: ${ans.create_time ?? ""}`);
+    lines.push(`answered_by: "${esc(ans.owner?.name ?? "匿名")}"`);
+    lines.push(`answered_by_id: ${ans.owner?.user_id ?? ""}`);
+    if (meta) lines.push(`answered_by_is_owner: ${ans.owner?.user_id === meta.ownerId}`);
+  }
   if (meta?.keywords?.length) lines.push(`tags: [${meta.keywords.map((k) => esc(k)).join(", ")}]`);
   lines.push("---", "", `# ${titleOf(topic)}`, "", renderText(topic), "");
   if (comments && comments.length > 0) {
@@ -342,7 +366,7 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
     if (channels.length === 0) throw new Error(`[${label}] 没有任何可用的 tab`);
   } else {
     const scope = args.scope;
-    channels = [{ cursorKey: scope === "all" ? "all" : "digests", scopeLabel: scope, tabTitle: null, fetcher: (cursor) => client.listTopics(gid, scope, 20, cursor) }];
+    channels = [{ cursorKey: scope === "all" ? "all" : scope === "digested" ? "digests" : scope, scopeLabel: scope, tabTitle: null, fetcher: (cursor) => client.listTopics(gid, scope, 20, cursor) }];
   }
 
   const seen = new Set(gState.seen_topic_ids);
