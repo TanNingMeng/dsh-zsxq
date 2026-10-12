@@ -194,15 +194,18 @@ function authorOf(topic) {
   const t = topic.talk ?? topic.question ?? topic.answer ?? {};
   return t.owner ?? {};
 }
+/** 标题：API 的 title 字段是约 40 字预览串（自带 "..."），优先用正文首行还原完整标题。 */
 function titleOf(topic) {
-  const raw = String(topic.title ?? "").trim();
-  if (raw) return raw;
   const plain = textOf(topic)
     .replace(/<e[^>]*>/g, "")
     .replace(/<\/e>/g, "")
     .replace(/\s+/g, " ")
     .trim();
-  return plain.slice(0, 40) || "无标题";
+  const raw = String(topic.title ?? "").trim();
+  const firstLine = plain.slice(0, 60);
+  // title 被官方截断（以 .../… 结尾）且正文更长时，用正文首行作为标题
+  if (raw && !/[…]{1,3}$|\.\.\.?$/.test(raw)) return raw;
+  return firstLine || raw || "无标题";
 }
 /** 提取 <e type="hashtag|web" title="..."> 内的可读文本，保留正文主体。 */
 function renderText(topic) {
