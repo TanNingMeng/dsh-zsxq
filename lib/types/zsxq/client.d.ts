@@ -94,6 +94,15 @@ export declare class ZsxqClient {
         topics: ZsxqTopic[];
         nextEndTime?: string;
     }>;
+    /** 星球话题标签（tab）列表，如 #面试#。hashtag_id 可能超过 JS 安全整数。 */
+    listHashtags(groupId: string | number): Promise<{
+        hashtags: Array<Record<string, unknown>>;
+    }>;
+    /** 话题标签下的主题列表（球内 tab 内容）。分页规则同 listTopics。 */
+    listHashtagTopics(hashtagId: string | number, count?: number, endTime?: string): Promise<{
+        topics: ZsxqTopic[];
+        nextEndTime?: string;
+    }>;
     /** 主题详情（含 talk/question/answer 内容）。 */
     getTopic(topicId: string | number): Promise<{
         topic: ZsxqTopic;

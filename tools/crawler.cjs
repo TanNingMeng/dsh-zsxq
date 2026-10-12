@@ -8,11 +8,13 @@
  *   node tools/crawler.js --group 48418884588288 --scope digests --out zsxq-vault/
  *   node tools/crawler.js --all-groups --author owner --out zsxq-vault/          # 只看球主发言
  *   node tools/crawler.js --group 48418884588288 --author admin --likes 10 --out zsxq-vault/
+ *   node tools/crawler.js --group 48418884588288 --tab 球友必看 --out zsxq-vault/   # 按球内 tab（话题标签）抓
  *
  * 参数：
  *   --group <id>        指定星球（可多次传入）
  *   --all-groups        爬取已加入的全部星球
- *   --scope <s>         digests（默认）= 精华 | all = 全部主题
+ *   --scope <s>         digests（默认）= 精华 | all = 全部主题（与 --tab 互斥，--tab 优先）
+ *   --tab <name|id>     话题标签 tab（如 球友必看、面试、Java 或 hashtag_id，可逗号分隔多个）
  *   --author <a>        owner = 只看球主 | admin = 球主+管理员 | all（默认）= 不过滤
  *   --likes <n>         只收点赞数 ≥ n 的主题
  *   --keywords <list>   逗号分隔词表，命中标题/正文才收录（不传则不过滤）
@@ -114,6 +116,17 @@ class ZsxqClient {
       end_time: endTime ?? ""
     });
   }
+  /** 话题标签（球内 tab，如 #球友必看#）列表。 */
+  listHashtags(groupId) {
+    return this.request("GET", `/groups/${groupId}/hashtags`).then((d) => d.hashtags ?? []);
+  }
+  /** 某话题标签下的主题列表。分页规则同 listTopics：ISO create_time 游标、闭区间需去重，无 next_end_time。 */
+  listHashtagTopics(hashtagId, count = 20, endTime) {
+    return this.request("GET", `/hashtags/${hashtagId}/topics`, {
+      count,
+      end_time: endTime ?? ""
+    });
+  }
   listComments(topicId, count = 20) {
     return this.request("GET", `/topics/${topicId}/comments`, { count });
   }
@@ -156,6 +169,7 @@ function parseArgs(argv) {
     groups: [],
     allGroups: false,
     scope: "digests",
+    tabs: [],
     author: "all",
     likes: 0,
     keywords: [],
@@ -170,6 +184,7 @@ function parseArgs(argv) {
     if (a === "--group") args.groups.push(String(argv[++i]));
     else if (a === "--all-groups") args.allGroups = true;
     else if (a === "--scope") args.scope = argv[++i];
+    else if (a === "--tab") args.tabs.push(...String(argv[++i]).split(",").map((s) => s.trim()).filter(Boolean));
     else if (a === "--author") args.author = argv[++i];
     else if (a === "--likes") args.likes = Number(argv[++i]) || 0;
     else if (a === "--keywords") args.keywords = String(argv[++i]).split(",").map((s) => s.trim()).filter(Boolean);
@@ -181,7 +196,8 @@ function parseArgs(argv) {
     else throw new Error(`未知参数：${a}`);
   }
   if (!args.allGroups && args.groups.length === 0) throw new Error("请指定 --group <id> 或 --all-groups");
-  if (!["digests", "digested", "all"].includes(args.scope)) throw new Error(`--scope 仅支持 digests|all，收到 ${args.scope}`);
+  if (args.tabs.length === 0 && !["digests", "digested", "all"].includes(args.scope))
+    throw new Error(`--scope 仅支持 digests|all，收到 ${args.scope}`);
   if (!["owner", "admin", "all"].includes(args.author)) throw new Error(`--author 仅支持 owner|admin|all，收到 ${args.author}`);
   return args;
 }
@@ -266,6 +282,7 @@ function renderTopicMd(topic, meta, comments) {
     `digested: ${!!topic.digested}`,
     `clawed_at: ${new Date().toISOString()}`
   ];
+  if (meta?.tab) lines.push(`tab: "${esc(meta.tab)}"`);
   if (meta?.keywords?.length) lines.push(`tags: [${meta.keywords.map((k) => esc(k)).join(", ")}]`);
   lines.push("---", "", `# ${titleOf(topic)}`, "", renderText(topic), "");
   if (comments && comments.length > 0) {
@@ -307,17 +324,39 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
     }
   }
 
-  const scope = args.scope;
-  const cursorKey = scope === "all" ? "all" : "digests";
-  let cursor = gState.cursors[cursorKey] ?? "";
+  // 解析 --tab：名称（模糊匹配，忽略#）或直接给 ID。tab 模式下忽略 --scope。
+  let channels = [];
+  if (args.tabs.length > 0) {
+    await limiter.wait();
+    const hashtags = await requestWithBackoff(client, () => client.listHashtags(gid), `${label}/hashtags`);
+    for (const tab of args.tabs) {
+      const hit = hashtags.find((h) => String(h.hashtag_id) === tab)
+        ?? hashtags.find((h) => String(h.title ?? "").replace(/^#|##$/g, "") === tab.replace(/^#|##$/g, ""))
+        ?? hashtags.find((h) => String(h.title ?? "").includes(tab.replace(/^#|##$/g, "")));
+      if (!hit) {
+        console.warn(`[${label}] 找不到 tab「${tab}」，可用：${hashtags.map((h) => h.title).join("、")}`);
+        continue;
+      }
+      channels.push({ cursorKey: `tab:${hit.hashtag_id}`, scopeLabel: `tab:${hit.title}`, tabTitle: hit.title, fetcher: (cursor) => client.listHashtagTopics(String(hit.hashtag_id), 20, cursor) });
+    }
+    if (channels.length === 0) throw new Error(`[${label}] 没有任何可用的 tab`);
+  } else {
+    const scope = args.scope;
+    channels = [{ cursorKey: scope === "all" ? "all" : "digests", scopeLabel: scope, tabTitle: null, fetcher: (cursor) => client.listTopics(gid, scope, 20, cursor) }];
+  }
+
   const seen = new Set(gState.seen_topic_ids);
   let collected = 0;
+  for (const ch of channels) {
+  const cursorKey = ch.cursorKey;
+  const scope = ch.scopeLabel;
+  let cursor = gState.cursors[cursorKey] ?? "";
 
   for (let page = 0; page < args.maxPages; page++) {
     await limiter.wait();
     let data;
     try {
-      data = await requestWithBackoff(client, () => client.listTopics(gid, scope, 20, cursor), `${label}/${scope}#${page}`);
+      data = await requestWithBackoff(client, () => ch.fetcher(cursor), `${label}/${scope}#${page}`);
       gState.failures = 0;
     } catch (err) {
       gState.failures++;
@@ -368,7 +407,7 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
       const file = path.join(dir, `${fileBase}.md`);
       const md = renderTopicMd(
         topic,
-        { groupName, ownerId, adminIds, keywords: hitKeywords },
+        { groupName, ownerId, adminIds, keywords: hitKeywords, tab: ch.tabTitle },
         comments
       );
       fs.writeFileSync(file, md, "utf8");
@@ -397,6 +436,7 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
   gState.last_run = new Date().toISOString();
   stats[`[${label}] 收录 ${collected} 篇`] = true;
   console.log(`[${label}] ✔ 收录 ${collected} 篇（scope=${scope}, author=${args.author}）`);
+  } // end channels
 }
 
 // ---------- 主流程 ----------
