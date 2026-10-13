@@ -819,6 +819,8 @@ async function crawlColumns(client, limiter, group, args, stats, state) {
   const label = group.name ?? gid;
   const gState = (state.groups[gid] ??= { name: label, cursors: {}, seen_topic_ids: [], last_run: null, failures: 0 });
   const failedDetails = (gState.column_detail_failures ??= {});
+  let colFailStreak = 0; // 连续详情失败计数（≥5 判定接口被批量拦截）
+  const colFailBuffer = []; // 本轮连续失败的主题，成功后洗白
   await limiter.wait();
   const columns = await requestWithBackoff(client, () => client.listColumns(gid), `${label}/columns`);
   if (columns.length === 0) {
@@ -829,7 +831,11 @@ async function crawlColumns(client, limiter, group, args, stats, state) {
   for (const col of columns) {
     const colDir = path.join(outDirSafe, sanitizeFilename(label), "columns", sanitizeFilename(col.name ?? String(col.column_id)));
     fs.mkdirSync(colDir, { recursive: true });
-    for (let index = 0; ; index += 20) {
+    for (let index = 0, pages = 0; ; index += 20, pages++) {
+      if (pages >= Math.max(args.maxPages, 20)) {
+        console.warn(`[${label}] 专栏「${col.name}」翻页达 ${pages} 页上限，转入下一个专栏`);
+        break;
+      }
       await limiter.wait();
       const data = await requestWithBackoff(client, () => client.listColumnTopics(gid, String(col.column_id), 20, index), `${label}/column:${col.name}#${index}`);
       const items = data.topics ?? [];
@@ -852,9 +858,26 @@ async function crawlColumns(client, limiter, group, args, stats, state) {
           }
         }
         if (!detail || Object.keys(detail).length === 0) {
+          // 连续失败 = 风控批量拦截详情接口，中止本轮专栏（不污染跳过清单）；零星失败 = 死主题，记入永久跳过
+          colFailStreak++;
+          colFailBuffer.push(tid);
+          if (colFailStreak >= 5) {
+            for (const b of colFailBuffer) delete failedDetails[b]; // 本轮连续失败全是风控误伤，洗白
+            colFailBuffer.length = 0;
+            console.warn(`[${label}] 连续 ${colFailStreak} 篇专栏详情失败，判定详情接口被批量拦截，专栏步骤本轮中止（下次运行续爬）`);
+            stats[`[${label}] 专栏详情被批量拦截，本轮中止`] = true;
+            return;
+          }
           failedDetails[tid] = new Date().toISOString();
           console.warn(`[${label}] 专栏文章 ${tid} 详情不可用（疑似已删除/受限），记入跳过清单`);
           continue;
+        }
+        if (colFailStreak > 0) {
+          // 详情恢复：洗白连续失败期间误记的主题
+          for (const b of colFailBuffer) delete failedDetails[b];
+          console.warn(`[${label}] 专栏详情恢复，洗白 ${colFailBuffer.length} 个误记主题`);
+          colFailBuffer.length = 0;
+          colFailStreak = 0;
         }
         const talk = detail.talk ?? {};
         const articleUrl = talk?.article?.article_url ?? talk?.article?.inline_article_url ?? null;
