@@ -12,7 +12,8 @@
 | `zsxq_config` | 配置/清除 Cookie | `cookie` / `reset` |
 | `zsxq_login` | 扫码登录（弹出系统 Chrome 窗口） | — |
 | `zsxq_groups` | 我加入的星球列表 | — |
-| `zsxq_topics` | 星球主题列表 | `group_id`, `scope`(all/digested), `count`, `end_time` |
+| `zsxq_topics` | 星球主题列表 | `group_id`, `scope`(all/digested), `hashtag_id`(指定 tab), `count`, `end_time` |
+| `zsxq_hashtags` | 星球话题标签（球内 tab，如 #球友必看#）列表 | `group_id` |
 | `zsxq_topic` | 主题详情 + 评论 | `topic_id`, `with_comments` |
 | `zsxq_search` | 星球内搜索 | `group_id`, `keyword`, `count` |
 | `zsxq_publish` | 发布主题（写操作） | `group_id`, `content` |
@@ -20,6 +21,19 @@
 | `zsxq_like` | 点赞（写操作） | `topic_id` |
 
 Web 设置面板：设置 → 知识星球（扫码登录 / 粘贴 Cookie / 测试连接 / 清除登录）。
+
+## Content Crawler (tools/crawler.cjs)
+
+A **read-only** companion crawler that turns a group's digests / all topics / Q&A / owner-only / tasks / hashtag tabs / columns (with full-length articles) / file index into an Obsidian-compatible Markdown vault (front-matter metadata + resumable state + throttling & backoff). Zero dependencies, runs on Node 18+:
+
+```bash
+node tools/crawler.cjs --group <id> --scope digests --out zsxq-vault/          # digests (default)
+node tools/crawler.cjs --group <id> --scope questions --comments 10 --out ...  # Q&A | by_owner | tasks
+node tools/crawler.cjs --group <id> --tab 球友必看,面试 --out zsxq-vault/       # hashtag tabs
+node tools/crawler.cjs --group <id> --columns --files --comments 10 --out ...  # columns + file index
+```
+
+Highlights: long-form article fulltext is fetched automatically via `talk.article.article_url` (the SSR page at `articles.zsxq.com` **requires the Cookie**; occasional logged-out shells are retried with `inline_article_url`); Q&A topics render both question and answer with authors; resumable cursors per scope/tab in `_meta/state.json`; file downloads are permission-blocked (code 1030) so `--files` writes a metadata index only. See [README.zh.md](README.zh.md) for details.
 
 ## 兼容性
 

@@ -12,7 +12,8 @@
 | `zsxq_config` | 配置/清除 Cookie | `cookie` / `reset` |
 | `zsxq_login` | 扫码登录（弹出系统 Chrome 窗口） | — |
 | `zsxq_groups` | 我加入的星球列表 | — |
-| `zsxq_topics` | 星球主题列表 | `group_id`, `scope`(all/digested), `count`, `end_time` |
+| `zsxq_topics` | 星球主题列表 | `group_id`, `scope`(all/digested), `hashtag_id`(指定 tab), `count`, `end_time` |
+| `zsxq_hashtags` | 星球话题标签（球内 tab，如 #球友必看#）列表 | `group_id` |
 | `zsxq_topic` | 主题详情 + 评论 | `topic_id`, `with_comments` |
 | `zsxq_search` | 星球内搜索 | `group_id`, `keyword`, `count` |
 | `zsxq_publish` | 发布主题（写操作） | `group_id`, `content` |
@@ -20,6 +21,29 @@
 | `zsxq_like` | 点赞（写操作） | `topic_id` |
 
 Web 设置面板：设置 → 知识星球（扫码登录 / 粘贴 Cookie / 测试连接 / 清除登录）。
+
+## 内容爬虫（tools/crawler.cjs）
+
+配套的**只读**爬虫：把星球的精华 / 全部 / 问答 / 只看星主 / 作业 / 话题标签 tab / 专栏（含长文全文）/ 星球文件索引，爬成 Obsidian 兼容的 Markdown 知识库（front-matter 元数据 + 断点续爬 + 节流退避）。零依赖，Node 18+ 直接运行：
+
+```bash
+# 精华（默认）
+node tools/crawler.cjs --group <id> --scope digests --out zsxq-vault/
+# 系统栏目：questions 问答 | by_owner 只看星主 | tasks 作业
+node tools/crawler.cjs --group <id> --scope questions --comments 10 --out zsxq-vault/
+# 球内话题标签 tab（名称或 hashtag_id，逗号分隔多个）
+node tools/crawler.cjs --group <id> --tab 球友必看,面试 --out zsxq-vault/
+# 右下角【专栏】全文 + 【星球文件】索引
+node tools/crawler.cjs --group <id> --columns --files --comments 10 --out zsxq-vault/
+```
+
+要点：
+
+- **长文全文自动补全**：星球长文（专栏文章、带文章附件的帖子）的 API `text` 只有约 60 字预览，爬虫会自动经 `talk.article.article_url` 抓取 `articles.zsxq.com` 的 SSR 全文页（**必须携带 Cookie**）并转换为 Markdown；偶发未登录空壳页会自动换 `inline_article_url` 重试。
+- **问答完整内容**：q&a 类型主题渲染「提问（提问者）+ 回答（回答者）」两段，front-matter 记录 `answered_by` / `answered_by_is_owner`。
+- **分页坑**：`end_time` 仅接受 ISO 8601 `create_time`（epoch 会报 1001/1059），且为闭区间（重复一条，按 topic_id 去重）；话题标签/专栏/文件接口用 `index` 偏移分页。
+- **节流与风控**：默认 20s/请求（`--interval` 可调），遇风控按 60s → 300s → 1800s 退避重试；`_meta/state.json` 记录断点（每 scope / 每 tab 独立游标），重跑即为增量。
+- **已知限制**：星球文件的下载链接接口返回 1030 权限不足，`--files` 仅生成元数据索引（含来源主题 ID）。
 
 ## 兼容性
 
