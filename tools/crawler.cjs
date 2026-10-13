@@ -645,6 +645,7 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
   const cursorKey = ch.cursorKey;
   const scope = ch.scopeLabel;
   let cursor = gState.cursors[cursorKey] ?? "";
+  let emptyStreak = 0; // 连续空页计数（软风控会返回"成功但空"的数据）
 
   for (let page = 0; page < args.maxPages; page++) {
     await limiter.wait();
@@ -658,7 +659,16 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
       throw err;
     }
     const topics = data.topics ?? [];
-    if (topics.length === 0) break;
+    if (topics.length === 0) {
+      // 空页两种可能：真到底 / 软风控塞空数据。先重试一次再下结论
+      emptyStreak++;
+      if (emptyStreak >= 2) break;
+      console.warn(`[${label}] ${scope} 第 ${page} 页为空，45s 后重试同一页（防软风控空页误判到底）`);
+      await sleep(45_000);
+      page--;
+      continue;
+    }
+    emptyStreak = 0;
 
     let newCount = 0;
     for (const topic of topics) {
@@ -803,10 +813,12 @@ async function fetchFullArticle(client, limiter, label, tid, talk, fallbackText)
 }
 
 // ---------- 专栏 / 星球文件（右下角入口） ----------
-/** 爬取星球全部专栏文章为 Markdown。幂等：文件名含 topic_id，已存在则跳过。 */
-async function crawlColumns(client, limiter, group, args, stats) {
+/** 爬取星球全部专栏文章为 Markdown。幂等：文件名含 topic_id，已存在则跳过；详情失败的主题记入 state 跳过，不炸全场。 */
+async function crawlColumns(client, limiter, group, args, stats, state) {
   const gid = String(group.group_id);
   const label = group.name ?? gid;
+  const gState = (state.groups[gid] ??= { name: label, cursors: {}, seen_topic_ids: [], last_run: null, failures: 0 });
+  const failedDetails = (gState.column_detail_failures ??= {});
   await limiter.wait();
   const columns = await requestWithBackoff(client, () => client.listColumns(gid), `${label}/columns`);
   if (columns.length === 0) {
@@ -826,9 +838,24 @@ async function crawlColumns(client, limiter, group, args, stats) {
         const tid = String(t.topic_id ?? "");
         const file = path.join(colDir, `${String(t.create_time ?? "").slice(0, 10) || "unknown"}-${sanitizeFilename(String(t.title ?? "无标题"))}-${tid}.md`);
         if (tid && fs.existsSync(file)) continue; // 幂等
+        if (failedDetails[tid]) continue; // 曾详情失败的问题主题，直接跳过
         // 专栏列表接口的 text 只有 ~60 字预览；详情接口对长文也只有截断 text，全文在 talk.article.article_url 的 SSR 页面里
-        await limiter.wait();
-        const detail = await requestWithBackoff(client, () => client.getTopic(tid), `${label}/column-detail:${tid}`);
+        // 详情最多尝试 2 次（不走长退避，防止单篇死主题拖死整个专栏）
+        let detail = null;
+        for (let attempt = 0; attempt < 2 && !detail; attempt++) {
+          if (attempt > 0) await sleep(15_000);
+          await limiter.wait();
+          try {
+            detail = await client.getTopic(tid);
+          } catch (err) {
+            console.warn(`[${label}] 专栏文章详情失败 ${tid}（第 ${attempt + 1} 次）: ${err.message}`);
+          }
+        }
+        if (!detail || Object.keys(detail).length === 0) {
+          failedDetails[tid] = new Date().toISOString();
+          console.warn(`[${label}] 专栏文章 ${tid} 详情不可用（疑似已删除/受限），记入跳过清单`);
+          continue;
+        }
         const talk = detail.talk ?? {};
         const articleUrl = talk?.article?.article_url ?? talk?.article?.inline_article_url ?? null;
         const owner = talk.owner ?? t.owner ?? col.owner ?? { name: "匿名" };
@@ -982,7 +1009,7 @@ async function main() {
 
   for (const group of groups) {
     try {
-      if (args.columns) await crawlColumns(client, limiter, group, args, stats);
+      if (args.columns) await crawlColumns(client, limiter, group, args, stats, state);
       if (args.files) await crawlFiles(client, limiter, group, args, stats);
       if (args.columns || args.files) { saveState(outDirSafe, state); continue; }
       await crawlGroup(client, limiter, group, args, state, stats);
