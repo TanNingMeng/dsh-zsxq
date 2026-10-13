@@ -25,6 +25,7 @@
  *   --comments <n>      每篇附带前 n 条评论（默认 0 = 不带）
  *   --images / --no-images  图片本地化（默认开）：正文/文章图片下载到 <星球>/attachments/，Markdown 改写为相对链接
  *   --localize          只做图片本地化补漏（扫描已有 md，不发 API 请求；可配 --group 过滤星球目录名）
+ *   （自动）每次爬取会把星球简介落盘为 <星球>/星球简介.md；front-matter 含 reading/readers 阅读数字段
  *   --max-pages <n>     每星球每 scope 最多翻页数（默认 50，安全阀）
  *   --interval <sec>    请求间隔秒数（默认 15）
  *   --out <dir>         输出根目录（默认 ./zsxq-vault）
@@ -488,6 +489,8 @@ function renderTopicMd(topic, meta, comments) {
     `created: ${created}`,
     `likes: ${topic.likes_count ?? 0}`,
     `comments: ${topic.comments_count ?? 0}`,
+    `reading: ${topic.reading_count ?? 0}`,
+    `readers: ${topic.readers_count ?? 0}`,
     `digested: ${!!topic.digested}`,
     `clawed_at: ${new Date().toISOString()}`
   ];
@@ -528,18 +531,18 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
     failures: 0
   });
 
-  // L5：球主/管理员信息（1 次请求）
+  // L5：星球详情（1 次请求）：球主/管理员信息 + 星球简介落盘
   let ownerId = null;
   let adminIds = [];
-  if (args.author !== "all") {
-    await limiter.wait();
-    const detail = await requestWithBackoff(client, () => client.groupDetail(gid), `${label}/detail`);
-    ownerId = detail.group?.owner?.user_id ?? null;
-    adminIds = detail.group?.admin_ids ?? [];
-    if (args.author === "owner" && !ownerId) {
-      console.warn(`[${label}] 未拿到球主信息，跳过 author 过滤`);
-    }
+  await limiter.wait();
+  const detail = await requestWithBackoff(client, () => client.groupDetail(gid), `${label}/detail`);
+  const grpInfo = detail.group ?? {};
+  ownerId = grpInfo.owner?.user_id ?? null;
+  adminIds = grpInfo.admin_ids ?? [];
+  if (args.author === "owner" && !ownerId) {
+    console.warn(`[${label}] 未拿到球主信息，跳过 author 过滤`);
   }
+  writeGroupIntro(outDirSafe, sanitizeFilename(groupName), grpInfo, label);
 
   // 解析 --tab：名称（模糊匹配，忽略#）或直接给 ID。tab 模式下忽略 --scope。
   let channels = [];
@@ -663,6 +666,41 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
   stats[`[${label}] 收录 ${collected} 篇`] = true;
   console.log(`[${label}] ✔ 收录 ${collected} 篇（scope=${scope}, author=${args.author}）`);
   } // end channels
+}
+
+/** 星球简介落盘：简介/资源清单、星主介绍、公告、统计。每次爬取覆盖写，幂等。 */
+function writeGroupIntro(outDir, groupDirName, grp, label) {
+  try {
+    const stat = grp.statistics ?? {};
+    const lines = [
+      "---",
+      `group_id: ${grp.group_id ?? ""}`,
+      `name: "${esc(grp.name ?? "")}"`,
+      `owner: "${esc(grp.owner?.name ?? "")}"`,
+      `category: "${esc(grp.category ?? "")}"`,
+      `created: ${grp.create_time ?? ""}`,
+      `members: ${stat.members_count ?? grp.members_count ?? 0}`,
+      `topics: ${stat.topics_count ?? grp.topics_count ?? 0}`,
+      `digests: ${stat.digests_count ?? grp.digests_count ?? 0}`,
+      `clawed_at: ${new Date().toISOString()}`,
+      "---",
+      "",
+      `# ${grp.name ?? label} 星球简介`,
+      ""
+    ];
+    const noticeText = grp.notice ? String(typeof grp.notice === "string" ? grp.notice : grp.notice.text ?? "").trim() : "";
+    if (noticeText) lines.push(`## 公告`, "", noticeText, "");
+    const desc = String(grp.description ?? "").trim();
+    if (desc) lines.push(`## 简介 / 资源清单`, "", desc, "");
+    const ownerDesc = String(grp.owner?.description ?? "").trim();
+    if (ownerDesc || grp.owner?.name) {
+      lines.push(`## 星主介绍`, "", `**${grp.owner?.name ?? "星主"}**${grp.owner?.alias ? `（${grp.owner.alias}）` : ""}`, "", ownerDesc || "（未填写）", "");
+    }
+    fs.mkdirSync(path.join(outDir, groupDirName), { recursive: true });
+    fs.writeFileSync(path.join(outDir, groupDirName, "星球简介.md"), lines.join("\n"), "utf8");
+  } catch (err) {
+    console.warn(`[${label}] 星球简介写入失败：${err.message}`);
+  }
 }
 
 /** 长文全文获取：talk.article.article_url 的 SSR 页（偶发空壳页时换 URL 重试）。返回最终正文（Markdown 或 API 文本）。 */

@@ -13,6 +13,8 @@
 - 问答（q&a）主题完整渲染提问与回答双方内容，front-matter 新增 `answered_by`/`answered_by_is_owner` 等字段。
 - 图片本地化：正文/文章图片自动下载到 `<星球>/attachments/`（URL 哈希命名、进程内去重、温和节流），Markdown 改写为相对链接，Obsidian 离线可预览；`images.zsxq.com` 签名 URL（带过期 token）不再依赖 CDN 时效。默认开启（`--no-images` 关闭）。
 - `--localize` 补漏模式：扫描已有库内 Markdown，把仍指向 zsxq CDN 的图片补下载到本地并改写链接（纯本地 + 图片 CDN，不发星球 API 请求；可配 `--group` 过滤星球目录）。
+- 星球简介落盘：每次爬取自动生成 `<星球>/星球简介.md`（front-matter 含成员/主题/精华数，正文含简介与资源清单、星主介绍、公告）。
+- 主题 front-matter 新增 `reading`/`readers` 阅读数字段，可用于按热度筛选内容。
 
 ### 修复
 
