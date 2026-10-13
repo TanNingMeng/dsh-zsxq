@@ -26,6 +26,7 @@
  *   --images / --no-images  图片本地化（默认开）：正文/文章图片下载到 <星球>/attachments/，Markdown 改写为相对链接
  *   --localize          只做图片本地化补漏（扫描已有 md，不发 API 请求；可配 --group 过滤星球目录名）
  *   （自动）每次爬取会把星球简介落盘为 <星球>/星球简介.md；front-matter 含 reading/readers 阅读数字段
+ *   --deep              深挖模式：无视"整页已见"继续向历史翻页（新渠道首次全量补史必开；靠空页或 --max-pages 终止）
  *   --no-official      禁用官方 MCP 通道（zsxq-cli）：默认启用时元数据/评论/标签走官方免风控接口
  *   --max-pages <n>     每星球每 scope 最多翻页数（默认 50，安全阀）
  *   --interval <sec>    请求间隔秒数（默认 15）
@@ -284,6 +285,7 @@ function parseArgs(argv) {
     images: true,
     official: true,
     localize: false,
+    deep: false,
     maxPages: 50,
     intervalSec: 15,
     out: "./zsxq-vault",
@@ -305,6 +307,7 @@ function parseArgs(argv) {
     else if (a === "--no-images") args.images = false;
     else if (a === "--localize") args.localize = true;
     else if (a === "--no-official") args.official = false;
+    else if (a === "--deep") args.deep = true;
     else if (a === "--max-pages") args.maxPages = Number(argv[++i]) || 50;
     else if (a === "--interval") args.intervalSec = Number(argv[++i]) || 15;
     else if (a === "--out") args.out = argv[++i];
@@ -737,11 +740,7 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
 
     const anyNew = newCount > 0;
     if (args.limit > 0 && collected >= args.limit) break;
-    if (!anyNew && page > 0 && scope === "digests") {
-      // 精华列表翻到重复页即认为到底（增量场景）
-      // 注意：首次全量时第一页全是新内容，不影响
-    }
-    if (!anyNew) break; // 追到已见内容，增量完成
+    if (!anyNew && !args.deep) break; // 增量模式：追到已见内容即完成；--deep 模式无视已见继续向历史深挖（靠空页/翻页上限终止）
   }
 
   gState.cursors[cursorKey] = cursor;
