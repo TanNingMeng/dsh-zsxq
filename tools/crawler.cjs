@@ -385,6 +385,7 @@ function renderTopicMd(topic, meta, comments) {
     `clawed_at: ${new Date().toISOString()}`
   ];
   if (meta?.tab) lines.push(`tab: "${esc(meta.tab)}"`);
+  if (meta?.fullText !== undefined && topic.talk?.article?.article_url) lines.push(`article_url: "${esc(topic.talk.article.article_url)}"`);
   const ans = answerOf(topic);
   if (ans) {
     lines.push(`answered: ${ans.create_time ?? ""}`);
@@ -393,7 +394,7 @@ function renderTopicMd(topic, meta, comments) {
     if (meta) lines.push(`answered_by_is_owner: ${ans.owner?.user_id === meta.ownerId}`);
   }
   if (meta?.keywords?.length) lines.push(`tags: [${meta.keywords.map((k) => esc(k)).join(", ")}]`);
-  lines.push("---", "", `# ${titleOf(topic)}`, "", renderText(topic), "");
+  lines.push("---", "", `# ${titleOf(topic)}`, "", meta?.fullText !== undefined ? meta.fullText : renderText(topic), "");
   if (comments && comments.length > 0) {
     lines.push(`## 评论（${comments.length} 条）`, "");
     for (const c of comments) {
@@ -508,6 +509,12 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
         }
       }
 
+      // ---- 长文全文（talk.article 存在时列表 text 只是预览，需抓 SSR 文章页）----
+      let fullTextOverride;
+      if (topic.talk?.article?.article_url || topic.talk?.article?.inline_article_url) {
+        fullTextOverride = await fetchFullArticle(client, limiter, label, tid, topic.talk, textOf(topic));
+      }
+
       // ---- 落盘 ----
       const month = (topic.create_time ?? "").slice(0, 7) || "unknown";
       const dir = path.join(outDirSafe, sanitizeFilename(groupName), month);
@@ -516,7 +523,7 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
       const file = path.join(dir, `${fileBase}.md`);
       const md = renderTopicMd(
         topic,
-        { groupName, ownerId, adminIds, keywords: hitKeywords, tab: ch.tabTitle },
+        { groupName, ownerId, adminIds, keywords: hitKeywords, tab: ch.tabTitle, fullText: fullTextOverride },
         comments
       );
       fs.writeFileSync(file, md, "utf8");
@@ -546,6 +553,31 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
   stats[`[${label}] 收录 ${collected} 篇`] = true;
   console.log(`[${label}] ✔ 收录 ${collected} 篇（scope=${scope}, author=${args.author}）`);
   } // end channels
+}
+
+/** 长文全文获取：talk.article.article_url 的 SSR 页（偶发空壳页时换 URL 重试）。返回最终正文（Markdown 或 API 文本）。 */
+async function fetchFullArticle(client, limiter, label, tid, talk, fallbackText) {
+  let fullText = fallbackText;
+  const articleUrl = talk?.article?.article_url ?? talk?.article?.inline_article_url ?? null;
+  if (!articleUrl) return fullText;
+  const candidates = [...new Set([articleUrl, talk?.article?.inline_article_url, talk?.article?.article_url].filter(Boolean))];
+  for (const u of candidates) {
+    await limiter.wait();
+    try {
+      const html = await requestWithBackoff(client, () => client.getArticleHtml(u), `${label}/article:${tid}`);
+      const bodyHtml = extractArticleBody(html);
+      if (!bodyHtml) {
+        console.warn(`[${label}] 文章页疑似空壳（${html.length}B）：${u}，换下一个 URL`);
+        continue;
+      }
+      const md = htmlToMd(bodyHtml);
+      if (md.length > fullText.replace(/<[^>]*>/g, "").length) fullText = md; // 全文优先
+      break;
+    } catch (err) {
+      console.warn(`[${label}] 文章全文获取失败 ${tid}: ${err.message}（回退为 API 文本）`);
+    }
+  }
+  return fullText;
 }
 
 // ---------- 专栏 / 星球文件（右下角入口） ----------
@@ -578,28 +610,7 @@ async function crawlColumns(client, limiter, group, args, stats) {
         const talk = detail.talk ?? {};
         const owner = talk.owner ?? t.owner ?? col.owner ?? { name: "匿名" };
         // 拉全文
-        let fullText = talk.text ?? t.text ?? "";
-        const articleUrl = talk.article?.article_url ?? talk.article?.inline_article_url ?? null;
-        if (articleUrl) {
-          // article_url 偶发返回未登录空壳页（~1.6KB、无 ql-editor），换 inline_article_url 再试一次
-          const candidates = [...new Set([articleUrl, talk.article?.inline_article_url, talk.article?.article_url].filter(Boolean))];
-          for (const u of candidates) {
-            await limiter.wait();
-            try {
-              const html = await requestWithBackoff(client, () => client.getArticleHtml(u), `${label}/column-article:${tid}`);
-              const bodyHtml = extractArticleBody(html);
-              if (!bodyHtml) {
-                console.warn(`[${label}] 文章页疑似空壳（${html.length}B）：${u}，换下一个 URL`);
-                continue;
-              }
-              const md = htmlToMd(bodyHtml);
-              if (md.length > fullText.replace(/<[^>]*>/g, "").length) fullText = md; // 全文优先
-              break;
-            } catch (err) {
-              console.warn(`[${label}] 文章全文获取失败 ${tid}: ${err.message}（回退为详情文本）`);
-            }
-          }
-        }
+        const fullText = await fetchFullArticle(client, limiter, label, tid, talk, talk.text ?? t.text ?? "");
         // 评论（可选）
         let comments = [];
         if (args.comments > 0 && (detail.comments_count ?? 0) > 0) {
