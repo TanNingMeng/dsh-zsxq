@@ -15,6 +15,7 @@
 - `--localize` 补漏模式：扫描已有库内 Markdown，把仍指向 zsxq CDN 的图片补下载到本地并改写链接（纯本地 + 图片 CDN，不发星球 API 请求；可配 `--group` 过滤星球目录）。
 - 星球简介落盘：每次爬取自动生成 `<星球>/星球简介.md`（front-matter 含成员/主题/精华数，正文含简介与资源清单、星主介绍、公告）。
 - 主题 front-matter 新增 `reading`/`readers` 阅读数字段，可用于按热度筛选内容。
+- 官方 MCP 通道集成（`zsxq-cli`，OAuth 登录后可用）：评论、话题标签、星球详情、专栏列表走官方接口免 1059 风控且不受 20s 节流约束，失败自动回退 cookie 直连（`--no-official` 可禁用）；评论渲染新增楼中楼（`replied_comments`）。正文端点受星球级 Skill 门禁，仍走 cookie 直连。
 
 ### 修复
 

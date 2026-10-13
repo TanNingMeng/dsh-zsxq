@@ -26,6 +26,7 @@
  *   --images / --no-images  图片本地化（默认开）：正文/文章图片下载到 <星球>/attachments/，Markdown 改写为相对链接
  *   --localize          只做图片本地化补漏（扫描已有 md，不发 API 请求；可配 --group 过滤星球目录名）
  *   （自动）每次爬取会把星球简介落盘为 <星球>/星球简介.md；front-matter 含 reading/readers 阅读数字段
+ *   --no-official      禁用官方 MCP 通道（zsxq-cli）：默认启用时元数据/评论/标签走官方免风控接口
  *   --max-pages <n>     每星球每 scope 最多翻页数（默认 50，安全阀）
  *   --interval <sec>    请求间隔秒数（默认 15）
  *   --out <dir>         输出根目录（默认 ./zsxq-vault）
@@ -37,6 +38,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 const crypto = require("node:crypto");
+const { execFile } = require("node:child_process");
 
 // ---------- 精简只读客户端（逻辑与 lib/index.js 修好的 ZsxqClient 一致） ----------
 const API_BASE = "https://api.zsxq.com/v2";
@@ -58,6 +60,33 @@ function loadCookie() {
     throw new Error(`未找到有效登录 Cookie（${file}），请先在 DSH 中完成知识星球登录`);
   }
   return record.cookie;
+}
+
+// ---------- 官方 MCP 通道（zsxq-cli，OAuth 登录后免风控；仅覆盖未被星球级门禁的端点） ----------
+const ZSXQ_CLI_JS = process.env.ZSXQ_CLI_JS
+  ?? path.join(os.homedir(), "AppData", "Roaming", "npm", "node_modules", "zsxq-cli", "npm", "scripts", "zsxq-cli.js");
+let officialEnabled = true; // --no-official 可关
+function officialCliReady() {
+  return officialEnabled && fs.existsSync(ZSXQ_CLI_JS);
+}
+/** 调 zsxq-cli 的 MCP 工具，返回解析后的 JSON（{ok,success,...}）。 */
+function officialApi(tool, params) {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [ZSXQ_CLI_JS, "api", "call", tool, "--params", JSON.stringify(params)], { timeout: 60_000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout) => {
+      const out = String(stdout ?? "");
+      if (!out && err) return reject(new ZsxqError(`官方通道 ${tool} 失败: ${String(err.message).slice(0, 120)}`, 0));
+      let j;
+      try {
+        j = JSON.parse(out);
+      } catch {
+        return reject(new ZsxqError(`官方通道 ${tool} 返回非 JSON`, 0));
+      }
+      if (j.ok === false || j.success === false) {
+        return reject(new ZsxqError(`官方通道 ${tool}: ${j.error?.message ?? "未知错误"}`, 0));
+      }
+      resolve(j);
+    });
+  });
 }
 
 class ZsxqClient {
@@ -114,6 +143,17 @@ class ZsxqClient {
     return this.request("GET", "/groups", { scope: "joined" }).then((d) => d.groups ?? []);
   }
   groupDetail(groupId) {
+    if (officialCliReady()) {
+      return officialApi("call_zsxq_api", { method: "GET", path: `/v2/groups/${groupId}` })
+        .then((j) => {
+          if (j.body?.succeeded) return j.body.resp_data;
+          throw new ZsxqError(`官方通道群详情失败: ${j.body?.resp_err?.msg ?? "?"}`, 0);
+        })
+        .catch((err) => {
+          console.warn(`[官方] 群详情回退 cookie 直连: ${err.message}`);
+          return this.request("GET", `/groups/${groupId}`);
+        });
+    }
     return this.request("GET", `/groups/${groupId}`);
   }
   /** scope 对外沿用 digested 语义，内部映射官方的 digests。分页游标为 ISO create_time（闭区间，需按 topic_id 去重）。 */
@@ -124,8 +164,16 @@ class ZsxqClient {
       end_time: endTime ?? ""
     });
   }
-  /** 话题标签（球内 tab，如 #球友必看#）列表。 */
+  /** 话题标签（球内 tab，如 #球友必看#）列表。官方通道优先。 */
   listHashtags(groupId) {
+    if (officialCliReady()) {
+      return officialApi("get_group_hashtags", { group_id: String(groupId) })
+        .then((j) => j.hashtags ?? [])
+        .catch((err) => {
+          console.warn(`[官方] 标签列表回退 cookie 直连: ${err.message}`);
+          return this.request("GET", `/groups/${groupId}/hashtags`).then((d) => d.hashtags ?? []);
+        });
+    }
     return this.request("GET", `/groups/${groupId}/hashtags`).then((d) => d.hashtags ?? []);
   }
   /** 某话题标签下的主题列表。分页规则同 listTopics：ISO create_time 游标、闭区间需去重，无 next_end_time。 */
@@ -139,11 +187,31 @@ class ZsxqClient {
   getTopic(topicId) {
     return this.request("GET", `/topics/${topicId}`).then((d) => d.topic ?? {});
   }
+  /** 评论列表：官方 MCP 免风控优先（扁平结构，渲染层 c.comment ?? c 兼容），失败回退 cookie 直连。 */
   listComments(topicId, count = 20) {
+    if (officialCliReady()) {
+      return officialApi("get_topic_comments", { topic_id: String(topicId), limit: count })
+        .then((j) => ({ comments: j.comments ?? [] }))
+        .catch((err) => {
+          console.warn(`[官方] 评论回退 cookie 直连: ${err.message}`);
+          return this.request("GET", `/topics/${topicId}/comments`, { count });
+        });
+    }
     return this.request("GET", `/topics/${topicId}/comments`, { count });
   }
-  /** 专栏列表（右下角【专栏】）。 */
+  /** 专栏列表（右下角【专栏】）。官方通道优先。 */
   listColumns(groupId) {
+    if (officialCliReady()) {
+      return officialApi("call_zsxq_api", { method: "GET", path: `/v2/groups/${groupId}/columns` })
+        .then((j) => {
+          if (j.body?.succeeded) return j.body.resp_data.columns ?? [];
+          throw new ZsxqError(`官方通道专栏列表失败: ${j.body?.resp_err?.msg ?? "?"}`, 0);
+        })
+        .catch((err) => {
+          console.warn(`[官方] 专栏列表回退 cookie 直连: ${err.message}`);
+          return this.request("GET", `/groups/${groupId}/columns`).then((d) => d.columns ?? []);
+        });
+    }
     return this.request("GET", `/groups/${groupId}/columns`).then((d) => d.columns ?? []);
   }
   /** 专栏文章列表。轻量结构 {topic_id,title,text,create_time}，index 为偏移分页。 */
@@ -214,6 +282,7 @@ function parseArgs(argv) {
     keywords: [],
     comments: 0,
     images: true,
+    official: true,
     localize: false,
     maxPages: 50,
     intervalSec: 15,
@@ -235,6 +304,7 @@ function parseArgs(argv) {
     else if (a === "--images") args.images = true;
     else if (a === "--no-images") args.images = false;
     else if (a === "--localize") args.localize = true;
+    else if (a === "--no-official") args.official = false;
     else if (a === "--max-pages") args.maxPages = Number(argv[++i]) || 50;
     else if (a === "--interval") args.intervalSec = Number(argv[++i]) || 15;
     else if (a === "--out") args.out = argv[++i];
@@ -512,6 +582,10 @@ function renderTopicMd(topic, meta, comments) {
       const who = cm.owner?.name ?? "匿名";
       const ctext = String(cm.text ?? "").replace(/\s+/g, " ").slice(0, 500);
       lines.push(`- **${who}**：${ctext}`);
+      for (const rc of cm.replied_comments ?? []) {
+        const rtext = String(rc.text ?? "").replace(/\s+/g, " ").slice(0, 300);
+        lines.push(`  - ↳ **${rc.owner?.name ?? "匿名"}**：${rtext}`);
+      }
     }
     lines.push("");
   }
@@ -610,7 +684,7 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
       // ---- 评论（可选，1 次请求/篇）----
       let comments = [];
       if (args.comments > 0 && (topic.comments_count ?? 0) > 0) {
-        await limiter.wait();
+        if (!officialCliReady()) await limiter.wait(); // 官方通道不受 20s 节流约束
         try {
           const cd = await requestWithBackoff(client, () => client.listComments(tid, args.comments), `${label}/comments/${tid}`);
           comments = (cd.comments ?? []).slice(0, args.comments);
@@ -763,7 +837,7 @@ async function crawlColumns(client, limiter, group, args, stats) {
         // 评论（可选）
         let comments = [];
         if (args.comments > 0 && (detail.comments_count ?? 0) > 0) {
-          await limiter.wait();
+          if (!officialCliReady()) await limiter.wait(); // 官方通道不受 20s 节流约束
           try {
             const cd = await requestWithBackoff(client, () => client.listComments(tid, args.comments), `${label}/column-comments/${tid}`);
             comments = (cd.comments ?? []).slice(0, args.comments);
@@ -798,6 +872,10 @@ async function crawlColumns(client, limiter, group, args, stats) {
             const who = cm.owner?.name ?? "匿名";
             const ctext = renderRich(t, String(cm.text ?? ""), cm.images).replace(/\s+/g, " ").slice(0, 500);
             lines.push(`- **${who}**：${ctext}`);
+            for (const rc of cm.replied_comments ?? []) {
+              const rtext = String(rc.text ?? "").replace(/\s+/g, " ").slice(0, 300);
+              lines.push(`  - ↳ **${rc.owner?.name ?? "匿名"}**：${rtext}`);
+            }
           }
           lines.push("");
         }
@@ -879,6 +957,8 @@ async function main() {
   outDirSafe = path.resolve(args.out);
   fs.mkdirSync(outDirSafe, { recursive: true });
   COOKIE = loadCookie();
+  officialEnabled = args.official;
+  if (officialCliReady()) console.log("官方 MCP 通道：已启用（元数据/评论/标签走 zsxq-cli，正文走 cookie 直连）");
 
   // --localize：只做图片本地化补漏，不发起任何星球 API 请求
   if (args.localize) {
