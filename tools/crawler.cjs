@@ -10,6 +10,7 @@
  *   node tools/crawler.js --group 48418884588288 --author admin --likes 10 --out zsxq-vault/
  *   node tools/crawler.js --group 48418884588288 --tab 球友必看 --out zsxq-vault/   # 按球内 tab（话题标签）抓
  *   node tools/crawler.js --group 88882228552542 --columns --files --out zsxq-vault/ # 右下角【专栏】+【星球文件】
+ *   node tools/crawler.js --localize --out zsxq-vault/          # 离线补漏：把库内仍指向 CDN 的图片下载到本地
  *
  * 参数：
  *   --group <id>        指定星球（可多次传入）
@@ -22,6 +23,8 @@
  *   --likes <n>         只收点赞数 ≥ n 的主题
  *   --keywords <list>   逗号分隔词表，命中标题/正文才收录（不传则不过滤）
  *   --comments <n>      每篇附带前 n 条评论（默认 0 = 不带）
+ *   --images / --no-images  图片本地化（默认开）：正文/文章图片下载到 <星球>/attachments/，Markdown 改写为相对链接
+ *   --localize          只做图片本地化补漏（扫描已有 md，不发 API 请求；可配 --group 过滤星球目录名）
  *   --max-pages <n>     每星球每 scope 最多翻页数（默认 50，安全阀）
  *   --interval <sec>    请求间隔秒数（默认 15）
  *   --out <dir>         输出根目录（默认 ./zsxq-vault）
@@ -32,6 +35,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
+const crypto = require("node:crypto");
 
 // ---------- 精简只读客户端（逻辑与 lib/index.js 修好的 ZsxqClient 一致） ----------
 const API_BASE = "https://api.zsxq.com/v2";
@@ -208,6 +212,8 @@ function parseArgs(argv) {
     likes: 0,
     keywords: [],
     comments: 0,
+    images: true,
+    localize: false,
     maxPages: 50,
     intervalSec: 15,
     out: "./zsxq-vault",
@@ -225,6 +231,9 @@ function parseArgs(argv) {
     else if (a === "--likes") args.likes = Number(argv[++i]) || 0;
     else if (a === "--keywords") args.keywords = String(argv[++i]).split(",").map((s) => s.trim()).filter(Boolean);
     else if (a === "--comments") args.comments = Number(argv[++i]) || 0;
+    else if (a === "--images") args.images = true;
+    else if (a === "--no-images") args.images = false;
+    else if (a === "--localize") args.localize = true;
     else if (a === "--max-pages") args.maxPages = Number(argv[++i]) || 50;
     else if (a === "--interval") args.intervalSec = Number(argv[++i]) || 15;
     else if (a === "--out") args.out = argv[++i];
@@ -348,6 +357,104 @@ function extractArticleBody(html) {
   const m2 = html.match(/<div class="milkdown-preview"[^>]*>([\s\S]*?)<\/div>/);
   if (m2) return m2[1];
   return null;
+}
+
+// ---------- 图片本地化 ----------
+let COOKIE = "";
+const IMG_CDN_RE = /\.zsxq\.com\//;
+const MD_IMG_RE = /(!\[[^\]]*\]\()\s*(https?:\/\/[^\s)]+)\s*(\))/g;
+const EXT_BY_CT = { "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp", "image/bmp": ".bmp", "image/svg+xml": ".svg" };
+const imgCache = new Map(); // "attachmentsDir\u0000url" → 绝对路径 | null（失败）
+const imgStats = { downloaded: 0, cached: 0, failed: 0, bytes: 0 };
+
+/** 下载单张图片到 attachmentsDir，文件名为 URL 的 sha1 前 20 位（同名已存在直接复用）。失败返回 null。 */
+async function downloadImage(url, attachmentsDir) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        headers: { Cookie: COOKIE, "User-Agent": BROWSER_UA, Referer: "https://wx.zsxq.com/" },
+        signal: AbortSignal.timeout(30_000)
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const ct = (resp.headers.get("content-type") ?? "").split(";")[0].trim();
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (!ct.startsWith("image/") || buf.length < 500) throw new Error(`非图片响应（${ct || "unknown"}, ${buf.length}B）`);
+      const file = path.join(attachmentsDir, crypto.createHash("sha1").update(url).digest("hex").slice(0, 20) + (EXT_BY_CT[ct] ?? ".jpg"));
+      if (!fs.existsSync(file)) fs.writeFileSync(file, buf);
+      return file;
+    } catch (err) {
+      if (attempt === 1) {
+        console.warn(`[图片] 下载失败 ${url} → ${err.message}`);
+        return null;
+      }
+      await sleep(3_000);
+    }
+  }
+  return null;
+}
+
+/** 把 Markdown 里指向 zsxq CDN 的图片下载到 attachmentsDir 并改写为相对链接（mdDir 为该 md 所在目录）。 */
+async function localizeImagesInMd(md, mdDir, attachmentsDir) {
+  const urls = [...new Set([...md.matchAll(MD_IMG_RE)].map((m) => m[2]).filter((u) => IMG_CDN_RE.test(u)))];
+  if (urls.length === 0) return md;
+  fs.mkdirSync(attachmentsDir, { recursive: true });
+  const resolved = new Map();
+  for (const u of urls) {
+    const key = attachmentsDir + "\u0000" + u;
+    if (!imgCache.has(key)) {
+      const file = await downloadImage(u, attachmentsDir);
+      imgCache.set(key, file);
+      if (file) {
+        imgStats.downloaded++;
+        imgStats.bytes += fs.statSync(file).size;
+      } else imgStats.failed++;
+      await sleep(300); // 图片 CDN 温和节流
+    } else if (imgCache.get(key)) {
+      imgStats.cached++;
+    }
+    const f = imgCache.get(key);
+    if (f) resolved.set(u, f);
+  }
+  if (resolved.size === 0) return md;
+  return md.replace(MD_IMG_RE, (whole, pre, url, post) => {
+    const f = resolved.get(url);
+    if (!f) return whole;
+    return pre + path.relative(mdDir, f).split(path.sep).join("/") + post;
+  });
+}
+
+/** --localize 补漏模式：扫描库内全部 Markdown（可按 --group 过滤星球目录名），把远程图片补下载到本地。纯本地 + 图片 CDN，不发 API 请求。 */
+async function localizeVault(outDir, groupFilter) {
+  const skipDirs = new Set(["_meta", "attachments"]);
+  function walk(dir) {
+    const out = [];
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.name.startsWith(".")) continue;
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (!skipDirs.has(e.name)) out.push(...walk(p));
+      } else if (e.name.endsWith(".md")) out.push(p);
+    }
+    return out;
+  }
+  const files = walk(outDir).filter((f) => {
+    if (groupFilter.length === 0) return true;
+    return groupFilter.includes(path.relative(outDir, f).split(path.sep)[0]);
+  });
+  console.log(`[localize] 待扫描 ${files.length} 个 md 文件...`);
+  let changed = 0;
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const groupDir = path.join(outDir, path.relative(outDir, f).split(path.sep)[0]);
+    const md = fs.readFileSync(f, "utf8");
+    const next = await localizeImagesInMd(md, path.dirname(f), path.join(groupDir, "attachments"));
+    if (next !== md) {
+      fs.writeFileSync(f, next, "utf8");
+      changed++;
+    }
+    if ((i + 1) % 50 === 0) console.log(`[localize] 进度 ${i + 1}/${files.length}（改写 ${changed}，下载 ${imgStats.downloaded}，失败 ${imgStats.failed}）`);
+  }
+  console.log(`[localize] 完成：扫描 ${files.length} 个 md，改写 ${changed} 个；新下载 ${imgStats.downloaded} 张（${(imgStats.bytes / 1048576).toFixed(1)} MB），缓存复用 ${imgStats.cached} 次，失败 ${imgStats.failed} 张。`);
 }
 
 // ---------- state.json ----------
@@ -521,11 +628,14 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
       fs.mkdirSync(dir, { recursive: true });
       const fileBase = `${(topic.create_time ?? "").slice(0, 10)}-${sanitizeFilename(titleOf(topic))}-${tid}`;
       const file = path.join(dir, `${fileBase}.md`);
-      const md = renderTopicMd(
+      let md = renderTopicMd(
         topic,
         { groupName, ownerId, adminIds, keywords: hitKeywords, tab: ch.tabTitle, fullText: fullTextOverride },
         comments
       );
+      if (args.images) {
+        md = await localizeImagesInMd(md, dir, path.join(outDirSafe, sanitizeFilename(groupName), "attachments"));
+      }
       fs.writeFileSync(file, md, "utf8");
 
       state.topics[tid] = { file: path.relative(outDirSafe, file), likes_last: topic.likes_count ?? 0, updated: new Date().toISOString() };
@@ -608,6 +718,7 @@ async function crawlColumns(client, limiter, group, args, stats) {
         await limiter.wait();
         const detail = await requestWithBackoff(client, () => client.getTopic(tid), `${label}/column-detail:${tid}`);
         const talk = detail.talk ?? {};
+        const articleUrl = talk?.article?.article_url ?? talk?.article?.inline_article_url ?? null;
         const owner = talk.owner ?? t.owner ?? col.owner ?? { name: "匿名" };
         // 拉全文
         const fullText = await fetchFullArticle(client, limiter, label, tid, talk, talk.text ?? t.text ?? "");
@@ -652,7 +763,11 @@ async function crawlColumns(client, limiter, group, args, stats) {
           }
           lines.push("");
         }
-        fs.writeFileSync(file, lines.join("\n"), "utf8");
+        let colMd = lines.join("\n");
+        if (args.images) {
+          colMd = await localizeImagesInMd(colMd, path.dirname(file), path.join(outDirSafe, sanitizeFilename(label), "attachments"));
+        }
+        fs.writeFileSync(file, colMd, "utf8");
         collected++;
         if (args.limit > 0 && collected >= args.limit) break;
       }
@@ -725,8 +840,15 @@ async function main() {
   const args = parseArgs(process.argv);
   outDirSafe = path.resolve(args.out);
   fs.mkdirSync(outDirSafe, { recursive: true });
+  COOKIE = loadCookie();
 
-  const client = new ZsxqClient(loadCookie());
+  // --localize：只做图片本地化补漏，不发起任何星球 API 请求
+  if (args.localize) {
+    await localizeVault(outDirSafe, args.groups);
+    return;
+  }
+
+  const client = new ZsxqClient(COOKIE);
   const limiter = new RateLimiter(args.intervalSec);
   const state = loadState(outDirSafe);
   const stats = {};
@@ -756,6 +878,9 @@ async function main() {
   saveState(outDirSafe, state);
   const total = Object.keys(state.topics).length;
   console.log(`\n完成。本次结果：${Object.keys(stats).join("；") || "无"}`);
+  if (imgStats.downloaded + imgStats.failed > 0) {
+    console.log(`图片本地化：新下载 ${imgStats.downloaded} 张（${(imgStats.bytes / 1048576).toFixed(1)} MB），缓存复用 ${imgStats.cached} 次，失败 ${imgStats.failed} 张`);
+  }
   console.log(`知识库累计主题：${total}，输出目录：${outDirSafe}`);
 }
 
