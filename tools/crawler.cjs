@@ -145,13 +145,17 @@ class ZsxqClient {
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(30_000)
     });
+    const dbg = process.env.ZSXQ_DEBUG;
+    if (dbg) console.error(`[debug] ${method} ${url.toString()} ts=${headers["X-Timestamp"]} rid=${headers["X-Request-Id"]} sig=${headers["X-Signature"]}`);
     if (resp.status === 401 || resp.status === 403) {
       throw new ZsxqError(`知识星球返回 ${resp.status}（Cookie 无效或已过期，请重新登录）`, resp.status);
     }
     let json;
+    let rawText = "";
     try {
       // topic_id/user_id 等为 16 位长整数，超出 JS Number 安全精度，先文本级转字符串再 parse
-      const raw = (await resp.text())
+      rawText = await resp.text();
+      const raw = rawText
         .replace(/("(?:topic_id|topic_uid|user_id|group_id|owner_id)"\s*:\s*)(\d{15,})/g, '$1"$2"')
         .replace(/("(?:admin_ids|guest_ids)"\s*:\s*\[)([^\]]*?)(\])/g, (_, head, ids, tail) =>
           head + ids.replace(/(\d{15,})/g, '"$1"') + tail
@@ -159,6 +163,9 @@ class ZsxqClient {
       json = JSON.parse(raw);
     } catch {
       throw new ZsxqError(`知识星球返回非 JSON（HTTP ${resp.status}），疑似风控或接口变更`, resp.status);
+    }
+    if (dbg && Array.isArray(json.resp_data?.topics) && json.resp_data.topics.length === 0) {
+      console.error(`[debug] 空topics响应原文: ${rawText.slice(0, 300)}`);
     }
     if (!json.succeeded) {
       throw new ZsxqError(
@@ -695,6 +702,15 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
     }
     const topics = data.topics ?? [];
     if (topics.length === 0) {
+      // 深挖模式特例：存量游标可能已落到接口历史窗口之外（列表接口只服务最近 ~2 周，
+      // 窗口外一律返回 succeeded=true + 空列表）。首页连续空页说明游标死了，丢弃游标从最新重走窗口。
+      if (args.deep && page === 0 && cursor) {
+        console.warn(`[${label}] ${scope} 存量游标首页为空（疑似低于接口历史窗口下限），丢弃游标从最新重走`);
+        cursor = "";
+        emptyStreak = 0;
+        page--;
+        continue;
+      }
       // 空页两种可能：真到底 / 软风控塞空数据。先重试一次再下结论
       emptyStreak++;
       if (emptyStreak >= 2) break;
