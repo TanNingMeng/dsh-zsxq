@@ -168,11 +168,9 @@ class ZsxqClient {
       console.error(`[debug] 空topics响应原文: ${rawText.slice(0, 300)}`);
     }
     if (!json.succeeded) {
-      throw new ZsxqError(
-        `知识星球接口失败: ${json.resp_err?.msg ?? `succeeded=false（code=${json.resp_err?.code ?? "?"}）`}`,
-        resp.status,
-        json.resp_err?.code
-      );
+      const code = json.resp_err?.code ?? json.code;
+      const msg = json.resp_err?.msg ?? json.info ?? `succeeded=false（code=${code ?? "?"}）`;
+      throw new ZsxqError(msg, resp.status, code);
     }
     return json.resp_data;
   }
@@ -898,6 +896,7 @@ async function crawlColumns(client, limiter, group, args, stats, state) {
     if (failureCountOf(tid) < CONFIRMED_ROUNDS) delete failedDetails[tid];
   };
   let colFailStreak = 0; // 连续详情失败计数（≥5 判定接口被批量拦截）
+  let lockedCount = 0; // 本轮命中"新成员 72h 阅读限制"的篇数
   const colFailBuffer = []; // 本轮连续失败的主题，成功后洗白
   await limiter.wait();
   const columns = await requestWithBackoff(client, () => client.listColumns(gid), `${label}/columns`);
@@ -926,15 +925,23 @@ async function crawlColumns(client, limiter, group, args, stats, state) {
         // 专栏列表接口的 text 只有 ~60 字预览；详情接口对长文也只有截断 text，全文在 talk.article.article_url 的 SSR 页面里
         // 详情最多尝试 2 次（不走长退避，防止单篇死主题拖死整个专栏）
         let detail = null;
-        for (let attempt = 0; attempt < 2 && !detail; attempt++) {
+        let locked = false; // 新成员 72h 阅读限制：临时锁，解锁后重跑自动补抓，不记跳过清单、不触发熔断
+        for (let attempt = 0; attempt < 2 && !detail && !locked; attempt++) {
           if (attempt > 0) await sleep(15_000);
           await limiter.wait();
           try {
             detail = await client.getTopic(tid);
           } catch (err) {
+            if (err.apiCode === 14841 || /72 小时|新成员阅读权限/.test(err.message ?? "")) {
+              locked = true;
+              lockedCount++;
+              console.warn(`[${label}] 专栏文章 ${tid} 受新成员 72h 阅读权限限制，本轮暂跳过（解锁后重跑自动补抓）`);
+              continue;
+            }
             console.warn(`[${label}] 专栏文章详情失败 ${tid}（第 ${attempt + 1} 次）: ${err.message}`);
           }
         }
+        if (locked) continue;
         if (!detail || Object.keys(detail).length === 0) {
           // 连续失败 = 风控批量拦截详情接口，中止本轮专栏；零星失败 = 死主题，记入跳过清单。
           // 跳过清单带跨轮失败计数：累计 ≥3 轮才坐实（批量拦截洗白时不误洗已证实的死主题）
@@ -1021,7 +1028,8 @@ async function crawlColumns(client, limiter, group, args, stats, state) {
     console.log(`[${label}] ✔ 专栏「${col.name}」处理完成`);
   }
   stats[`[${label}] 专栏收录 ${collected} 篇`] = true;
-  console.log(`[${label}] ✔ 专栏共收录 ${collected} 篇`);
+  if (lockedCount > 0) stats[`[${label}] 专栏 ${lockedCount} 篇受新成员 72h 限制暂跳过`] = true;
+  console.log(`[${label}] ✔ 专栏共收录 ${collected} 篇${lockedCount > 0 ? `（另有 ${lockedCount} 篇待 72h 权限解锁后补抓）` : ""}`);
 }
 
 /** 建星球文件索引（单个 Markdown 清单）。下载链接接口有权限限制（1030），仅记录元数据与来源主题。 */
