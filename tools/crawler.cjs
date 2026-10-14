@@ -46,6 +46,35 @@ const API_BASE = "https://api.zsxq.com/v2";
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+// ---------- 官方网页客户端签名（wx.zsxq.com 前端逆向，已用真实流量样本离线验证） ----------
+// 机制：X-Signature = SHA1(`<绝对URL含query> <X-Timestamp> <X-Request-Id>`)，无盐；
+// X-Request-Id 每请求随机（9-4-4-4-11 hex 连字符格式），X-Aduid 为持久"设备 ID"，X-Version 随前端版本。
+// 不带这套头的 API 请求会被风控判为"非官方工具访问"（1059/succeeded=false）。
+const ZSXQ_X_VERSION = "2.98.0";
+let xAduid = null; // main() 从 state 读取/初始化并持久化；未初始化时临时生成
+function genRequestId() {
+  let r = "";
+  for (let e = 0; e < 32; e++) {
+    r += Math.floor(Math.random() * 16).toString(16);
+    if (e === 8 || e === 12 || e === 16 || e === 20) r += "-";
+  }
+  return r;
+}
+function signedApiHeaders(absUrl) {
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const rid = genRequestId();
+  const qi = absUrl.indexOf("?");
+  const norm = qi === -1 ? absUrl : absUrl.slice(0, qi) + "?" + absUrl.slice(qi + 1).replace(/'/g, "%27");
+  const sig = crypto.createHash("sha1").update(`${norm} ${ts} ${rid}`).digest("hex");
+  return {
+    "X-Request-Id": rid,
+    "X-Version": ZSXQ_X_VERSION,
+    "X-Signature": sig,
+    "X-Timestamp": ts,
+    "X-Aduid": xAduid ?? (xAduid = genRequestId()),
+  };
+}
+
 class ZsxqError extends Error {
   constructor(message, status, apiCode) {
     super(message);
@@ -102,11 +131,12 @@ class ZsxqClient {
       }
     }
     const headers = {
-      Accept: "application/json",
+      Accept: "application/json, text/plain, */*",
       "User-Agent": BROWSER_UA,
       Referer: "https://wx.zsxq.com/",
       Origin: "https://wx.zsxq.com",
       Cookie: this.cookie,
+      ...signedApiHeaders(url.toString()),
       ...(body !== undefined ? { "Content-Type": "application/json;charset=UTF-8" } : {})
     };
     const resp = await fetch(url, {
@@ -1052,6 +1082,12 @@ async function main() {
   const client = new ZsxqClient(COOKIE);
   const limiter = new RateLimiter(args.intervalSec);
   const state = loadState(outDirSafe);
+  // X-Aduid（设备 ID）跨运行持久化：模拟同一台设备的官方网页客户端
+  xAduid = state.xaduid;
+  if (!xAduid) {
+    xAduid = state.xaduid = genRequestId();
+    saveState(outDirSafe, state);
+  }
   const stats = {};
 
   let groups;
