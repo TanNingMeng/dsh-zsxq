@@ -649,6 +649,8 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
   const scope = ch.scopeLabel;
   let cursor = gState.cursors[cursorKey] ?? "";
   let emptyStreak = 0; // 连续空页计数（软风控会返回"成功但空"的数据）
+  let dupStreak = 0; // 连续重复页计数（风控会把每页都替换成同样的首屏内容）
+  const pageSigs = new Set(); // 本频道已见过的页签名（主题 ID 集合）
 
   for (let page = 0; page < args.maxPages; page++) {
     await limiter.wait();
@@ -672,6 +674,21 @@ async function crawlGroup(client, limiter, group, args, state, stats) {
       continue;
     }
     emptyStreak = 0;
+
+    // 陈旧数据检测：正常游标翻页绝不会重复同一组主题 ID；连续重复 = 风控在喂陈旧首屏，
+    // 此时 --deep 会空烧几百页请求（实际发生过的案例：7 页的频道烧了近 200 页），必须熔断
+    const pageSig = topics.map((t) => String(t.topic_id)).sort().join(",");
+    if (pageSigs.has(pageSig)) {
+      dupStreak++;
+      console.warn(`[${label}] ${scope} 第 ${page} 页与之前的页内容完全重复（疑似风控陈旧数据，重复 ${dupStreak} 次）`);
+      if (dupStreak >= 2) {
+        console.warn(`[${label}] ${scope} 判定为风控陈旧数据模式，中止本频道深挖（避免空烧请求）`);
+        break;
+      }
+    } else {
+      dupStreak = 0;
+      pageSigs.add(pageSig);
+    }
 
     let newCount = 0;
     for (const topic of topics) {
@@ -818,6 +835,22 @@ async function crawlColumns(client, limiter, group, args, stats, state) {
   const label = group.name ?? gid;
   const gState = (state.groups[gid] ??= { name: label, cursors: {}, seen_topic_ids: [], last_run: null, failures: 0 });
   const failedDetails = (gState.column_detail_failures ??= {});
+  // 跳过清单条目：老格式为 ISO 字符串（计 1 轮），新格式为 {count, first, last}。
+  // 累计 ≥3 轮失败的视为已证实的死主题，批量拦截洗白时保留；兼容老条目逐步迁移。
+  const CONFIRMED_ROUNDS = 3;
+  const failureCountOf = (tid) => {
+    const e = failedDetails[tid];
+    if (!e) return 0;
+    return typeof e === "string" ? 1 : (e.count ?? 1);
+  };
+  const recordFailure = (tid) => {
+    const prev = failedDetails[tid];
+    const first = typeof prev === "string" ? prev : (prev?.first ?? new Date().toISOString());
+    failedDetails[tid] = { count: failureCountOf(tid) + 1, first, last: new Date().toISOString() };
+  };
+  const washFailure = (tid) => {
+    if (failureCountOf(tid) < CONFIRMED_ROUNDS) delete failedDetails[tid];
+  };
   let colFailStreak = 0; // 连续详情失败计数（≥5 判定接口被批量拦截）
   const colFailBuffer = []; // 本轮连续失败的主题，成功后洗白
   await limiter.wait();
@@ -857,23 +890,24 @@ async function crawlColumns(client, limiter, group, args, stats, state) {
           }
         }
         if (!detail || Object.keys(detail).length === 0) {
-          // 连续失败 = 风控批量拦截详情接口，中止本轮专栏（不污染跳过清单）；零星失败 = 死主题，记入永久跳过
+          // 连续失败 = 风控批量拦截详情接口，中止本轮专栏；零星失败 = 死主题，记入跳过清单。
+          // 跳过清单带跨轮失败计数：累计 ≥3 轮才坐实（批量拦截洗白时不误洗已证实的死主题）
           colFailStreak++;
           colFailBuffer.push(tid);
           if (colFailStreak >= 5) {
-            for (const b of colFailBuffer) delete failedDetails[b]; // 本轮连续失败全是风控误伤，洗白
+            for (const b of colFailBuffer) washFailure(b); // 本轮连续失败里，未被多轮证实的都是风控误伤，洗白
             colFailBuffer.length = 0;
             console.warn(`[${label}] 连续 ${colFailStreak} 篇专栏详情失败，判定详情接口被批量拦截，专栏步骤本轮中止（下次运行续爬）`);
             stats[`[${label}] 专栏详情被批量拦截，本轮中止`] = true;
             return;
           }
-          failedDetails[tid] = new Date().toISOString();
-          console.warn(`[${label}] 专栏文章 ${tid} 详情不可用（疑似已删除/受限），记入跳过清单`);
+          recordFailure(tid);
+          console.warn(`[${label}] 专栏文章 ${tid} 详情不可用（疑似已删除/受限，累计 ${failureCountOf(tid)} 轮），记入跳过清单`);
           continue;
         }
         if (colFailStreak > 0) {
           // 详情恢复：洗白连续失败期间误记的主题
-          for (const b of colFailBuffer) delete failedDetails[b];
+          for (const b of colFailBuffer) washFailure(b);
           console.warn(`[${label}] 专栏详情恢复，洗白 ${colFailBuffer.length} 个误记主题`);
           colFailBuffer.length = 0;
           colFailStreak = 0;
