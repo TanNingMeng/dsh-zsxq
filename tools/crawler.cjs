@@ -905,9 +905,12 @@ async function crawlColumns(client, limiter, group, args, stats, state) {
     return;
   }
   let collected = 0;
+  const lockedThisRun = new Set(); // 本轮已确认 72h 锁的主题，同轮不重复尝试详情
   for (const col of columns) {
     const colDir = path.join(outDirSafe, sanitizeFilename(label), "columns", sanitizeFilename(col.name ?? String(col.column_id)));
     fs.mkdirSync(colDir, { recursive: true });
+    const colPageSigs = new Set(); // 本专栏已见页签名（列表接口可能无视 offset 永远返回同一批）
+    let colDupStreak = 0;
     for (let index = 0, pages = 0; ; index += 20, pages++) {
       if (pages >= Math.max(args.maxPages, 20)) {
         console.warn(`[${label}] 专栏「${col.name}」翻页达 ${pages} 页上限，转入下一个专栏`);
@@ -917,11 +920,24 @@ async function crawlColumns(client, limiter, group, args, stats, state) {
       const data = await requestWithBackoff(client, () => client.listColumnTopics(gid, String(col.column_id), 20, index), `${label}/column:${col.name}#${index}`);
       const items = data.topics ?? [];
       if (items.length === 0) break;
+      // 列表翻页重复检测：专栏列表可能受可见窗口限制、无视 offset 永远返回同一批——立即转入下一专栏，防空烧
+      const colSig = items.map((t) => String(t.topic_id)).sort().join(",");
+      if (colPageSigs.has(colSig)) {
+        colDupStreak++;
+        if (colDupStreak >= 1) {
+          console.warn(`[${label}] 专栏「${col.name}」列表翻页返回重复内容（offset=${index}），判定列表已到可见窗口底，转入下一个专栏`);
+          break;
+        }
+      } else {
+        colDupStreak = 0;
+        colPageSigs.add(colSig);
+      }
       for (const t of items) {
         const tid = String(t.topic_id ?? "");
         const file = path.join(colDir, `${String(t.create_time ?? "").slice(0, 10) || "unknown"}-${sanitizeFilename(String(t.title ?? "无标题"))}-${tid}.md`);
         if (tid && fs.existsSync(file)) continue; // 幂等
         if (failedDetails[tid]) continue; // 曾详情失败的问题主题，直接跳过
+        if (lockedThisRun.has(tid)) continue; // 本轮已确认 72h 锁，不重复尝试
         // 专栏列表接口的 text 只有 ~60 字预览；详情接口对长文也只有截断 text，全文在 talk.article.article_url 的 SSR 页面里
         // 详情最多尝试 2 次（不走长退避，防止单篇死主题拖死整个专栏）
         let detail = null;
@@ -935,6 +951,7 @@ async function crawlColumns(client, limiter, group, args, stats, state) {
             if (err.apiCode === 14841 || /72 小时|新成员阅读权限/.test(err.message ?? "")) {
               locked = true;
               lockedCount++;
+              lockedThisRun.add(tid);
               console.warn(`[${label}] 专栏文章 ${tid} 受新成员 72h 阅读权限限制，本轮暂跳过（解锁后重跑自动补抓）`);
               continue;
             }
